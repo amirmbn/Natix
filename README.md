@@ -24,9 +24,7 @@ sudo wget https://raw.githubusercontent.com/amirmbn/Natix/main/install-natix.sh 
 <div align="right">
 
 - بعد از اجرا اسکریپت از شما تایید آی پی سرور ایران رو میخواد
-
 - در ادامه آی پی سرور خارج رو وارد کنید
-
 - پورت SSH که اگر تغییر نداده باشید 22 است
-
 - میتونید آی پی و پورت های دیگر رو هم در ادامه اضافه کنید
+</div>
