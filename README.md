@@ -17,7 +17,7 @@ sudo wget https://raw.githubusercontent.com/amirmbn/Natix/main/install-natix.sh 
 پورت SSH سرور ایران رو 22 در نظر گرفتیم اگر شما پورت SSH سرور خودتون رو تغییر دادید اینجا هم 22 رو تغییر بدید
 <br>
 
-## اهداف فعلی پروژه:
+## امکانات این اسکریپت:
 <div align="right">
 
 - شناسایی آی پی سرور به صورت اتوماتیک
