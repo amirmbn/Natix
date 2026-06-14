@@ -17,8 +17,6 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ─── helpers ────────────────────────────────────────────────
-
 log()    { echo -e "${GREEN}[✓]${NC} $1"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $1"; }
 error()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
@@ -52,8 +50,6 @@ validate_ip() {
 validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [[ $1 -ge 1 && $1 -le 65535 ]]
 }
-
-# ─── config ──────────────────────────────────────────────────
 
 save_config() {
     cat > "$CONFIG_FILE" <<EOF
@@ -91,8 +87,6 @@ edit_config() {
     info "Run '$0 apply' to apply the changes."
 }
 
-# ─── backup / restore ────────────────────────────────────────
-
 backup_rules() {
     mkdir -p "$BACKUP_DIR"
     local ts
@@ -124,8 +118,6 @@ list_backups() {
     fi
 }
 
-# ─── extra rules validation ──────────────────────────────────
-
 # Validates a single extra-rule string by checking the iptables
 # syntax with --check / a dry run instead of eval'ing raw input.
 validate_extra_rule() {
@@ -151,8 +143,6 @@ apply_extra_rule() {
     read -ra parts <<< "$rule"
     iptables "${parts[@]}"
 }
-
-# ─── iptables rules ──────────────────────────────────────────
 
 apply_rules() {
     local server_ip=$1
@@ -229,8 +219,6 @@ show_rules() {
     iptables -t nat -L -n -v --line-numbers
 }
 
-# ─── systemd service ─────────────────────────────────────────
-
 install_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -264,8 +252,6 @@ service_status() {
     systemctl status portforward.service 2>/dev/null || warn "Service is not installed."
 }
 
-# ─── uninstall ────────────────────────────────────────────────
-
 uninstall_all() {
     read -rp "This will flush NAT rules, remove the service and delete config. Continue? [y/N]: " confirm
     [[ "${confirm,,}" != "y" ]] && { warn "Aborted."; exit 0; }
@@ -275,8 +261,6 @@ uninstall_all() {
     rm -f "$CONFIG_FILE" /etc/sysctl.d/99-portforward.conf
     log "Uninstall complete."
 }
-
-# ─── interactive setup ────────────────────────────────────────
 
 interactive_setup() {
     require_iptables
@@ -338,8 +322,6 @@ interactive_setup() {
     read -rp "Install systemd service for auto-start on reboot? [y/N]: " svc
     [[ "${svc,,}" == "y" ]] && install_service
 }
-
-# ─── entry point ─────────────────────────────────────────────
 
 usage() {
     echo ""
