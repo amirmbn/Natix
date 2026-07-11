@@ -19,7 +19,7 @@ Forward Tunnel
 <div align="left">
   
 ```
-sudo wget https://raw.githubusercontent.com/amirmbn/Natix/main/install-natix.sh && sudo chmod +x install-natix.sh && sudo ./install-natix.sh
+bash <(curl -Ls https://raw.githubusercontent.com/amirmbn/Natix/main/install-natix.sh)
 ```
 </div>
 <div align="right">
