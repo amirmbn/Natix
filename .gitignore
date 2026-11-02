@@ -1,0 +1,7 @@
+/bin/
+/dist/
+*.test
+*.out
+release.bat
+
+/graphify-out/

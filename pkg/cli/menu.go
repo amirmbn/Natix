@@ -1,0 +1,743 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"natix/pkg/catalog"
+	"natix/pkg/conntest"
+	"natix/pkg/localproxy"
+	"natix/pkg/schedule"
+	"natix/pkg/speedtest"
+	"natix/pkg/tunnel"
+	"natix/pkg/version"
+)
+
+// StoreDir holds state.json and the per-tunnel env files.
+const StoreDir = "/etc/natix"
+
+func loadStore() (*catalog.Store, bool) {
+	st, err := catalog.LoadStore(StoreDir)
+	if err != nil {
+		Err(err.Error())
+		Pause()
+		return nil, false
+	}
+	return st, true
+}
+
+func RunInteractiveMenu() {
+	for {
+		Header()
+		Opt("0", "Connection Test", "which methods pass between two servers, and speed")
+		Opt("1", "Setup Iran", "new tunnel from this server to a kharej server")
+		Opt("2", "Setup Kharej", "paste the link printed on the iran server")
+		Opt("3", "Manage", "tunnels, status, health, tests")
+		Opt("4", "Optimize", "BBR, buffers, forwarding")
+		Opt("5", "Backup & Restore", "all tunnels in one file")
+		Opt("6", "Update", "latest GitHub release")
+		Opt("7", "Uninstall", "remove tunnels and Natix")
+		Opt("8", "Exit", "")
+		fmt.Println()
+		Rule()
+
+		switch Ask("Enter your choice [0-8]", "") {
+		case "0":
+			ConnectionTestScreen()
+		case "1":
+			setupWizard("iran")
+		case "2":
+			setupKharej()
+		case "3":
+			manageMenu()
+		case "4":
+			optimizeScreen()
+		case "5":
+			backupRestoreMenu()
+		case "6":
+			updateMenu()
+		case "7":
+			uninstallScreen()
+		case "8", "q", "exit":
+			fmt.Println()
+			return
+		}
+	}
+}
+
+// ─── Setup ───────────────────────────────────────────────────────────────────
+
+func chooseMethod() (catalog.MethodSpec, bool, bool) {
+	mode := ChooseOpt("Tunnel Mode", []MenuOpt{
+		{"DIRECT", "Standard tunnel (Iran connects directly to Kharej)"},
+		{"REVERSE", "Anti-DPI Reverse (Kharej dials into Iran; hides Kharej IP)"},
+	})
+	if mode == 0 {
+		return catalog.MethodSpec{}, false, false
+	}
+	reverse := (mode == 2)
+	Header()
+	var fam int
+	if reverse {
+		fam = ChooseOpt("Tunnel Layer (REVERSE)", []MenuOpt{
+			{"L3 kernel", "gre, 6to4, ipip, sit... inside the 8-stream TCP carrier; wireguard rides UDP"},
+			{"L2 kernel", "eoip, gretap, vxlan, geneve, l2tpv3, etherip inside the 8-stream TCP carrier"},
+			{"UDP-Crypt", "kharej dials UDP to iran; best on lossy or high-latency links (no TCP-in-TCP)"},
+		})
+	} else {
+		fam = ChooseOpt("Tunnel Layer (DIRECT)", []MenuOpt{
+			{"L3 kernel", "6to4, gre, ipip, wireguard, ipsec... fastest, no anti-DPI"},
+			{"L2 kernel", "eoip (MikroTik), gretap, vxlan, geneve, l2tpv3, etherip"},
+			{"UDP-Crypt", "encrypted UDP that looks like DTLS, QUIC, RTP, DNS..."},
+		})
+	}
+	if fam == 0 {
+		return catalog.MethodSpec{}, false, false
+	}
+	families := []catalog.Family{"", catalog.FamilyKernelL3, catalog.FamilyKernelL2, catalog.FamilyUDPCrypt}
+	var methods []catalog.MethodSpec
+	var opts []MenuOpt
+	for _, m := range catalog.Methods {
+		if m.Family == families[fam] && !(reverse && m.IPv6Underlay) {
+			methods = append(methods, m)
+			title, desc := m.Name, m.Title
+			if reverse {
+				if m.Family != catalog.FamilyUDPCrypt && m.Name != "wireguard" {
+					title = "frp+" + m.Name
+					desc = "TCP carrier (8 streams, TLS-shaped) + " + m.Title
+				} else {
+					title = "rev+" + m.Name
+					desc = "Reverse " + m.Title + " (Kharej dials into Iran)"
+				}
+			}
+			opts = append(opts, MenuOpt{Title: title, Desc: desc})
+		}
+	}
+	Header()
+	methodTitle := "Method (DIRECT)"
+	if reverse {
+		methodTitle = "Method (REVERSE)"
+	}
+	i := ChooseOpt(methodTitle, opts)
+	if i == 0 {
+		return catalog.MethodSpec{}, false, false
+	}
+	return methods[i-1], reverse, true
+}
+
+func askInt(prompt string, def int) int {
+	v, err := strconv.Atoi(Ask(prompt, strconv.Itoa(def)))
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func setupWizard(role string) {
+	st, ok := loadStore()
+	if !ok {
+		return
+	}
+	Header()
+	m, rev, ok := chooseMethod()
+	if !ok {
+		return
+	}
+	Header()
+	modeLabel := m.Name
+	if rev {
+		modeLabel += " (Reverse)"
+	}
+	Title("Setup " + role + " — " + modeLabel)
+
+	tc := catalog.TunnelConfig{Role: role, Method: m.Name, Reverse: rev, Index: tunnel.NextIndex(st.Tunnels)}
+	if m.IPv6Underlay {
+		tc.LocalIP = Ask("This server IPv6", detectIP("udp6", "[2001:4860:4860::8888]:80"))
+		remPrompt := "Remote server IPv6"
+		if tc.Reverse && role == "iran" {
+			remPrompt = "Remote server IPv6 (optional in reverse mode, Enter = dynamic)"
+		}
+		tc.RemoteIP = Ask(remPrompt, "")
+	} else {
+		tc.LocalIP = Ask("This server IP", detectIP("udp4", "8.8.8.8:80"))
+		remPrompt := "Remote server IP"
+		if tc.Reverse && role == "iran" {
+			remPrompt = "Remote server IP (optional in reverse mode, Enter = Kharej dials in)"
+		}
+		tc.RemoteIP = Ask(remPrompt, "")
+	}
+	tc.Index = askInt("Subnet index (10.77.N.0/30, unique per tunnel)", tc.Index)
+	tc.Name = Ask("Tunnel name (max 10: a-z 0-9 -, Enter = ir-<port> or kh-<port>)", "")
+	for {
+		prompt := "Secret token, same on both servers (Enter = random)"
+		if role == "kharej" {
+			prompt = "Secret token from the iran server"
+		}
+		in := Ask(prompt, "")
+		if in == "" && role == "iran" {
+			break // Normalize generates one; it is shown with the link
+		}
+		if _, err := catalog.TokenFromSecret(in); err != nil {
+			Err(err.Error())
+			continue
+		}
+		tc.Token = in
+		break
+	}
+	if !tunnel.IPv6Only(m.Name) {
+		defIran := fmt.Sprintf("10.77.%d.1", tc.Index)
+		defKharej := fmt.Sprintf("10.77.%d.2", tc.Index)
+		iranTun := Ask("Iran local tunnel IPv4", defIran)
+		kharejTun := Ask("Kharej local tunnel IPv4", defKharej)
+		if role == "kharej" {
+			tc.TunLocal4, tc.TunRemote4 = kharejTun, iranTun
+		} else {
+			tc.TunLocal4, tc.TunRemote4 = iranTun, kharejTun
+		}
+	}
+
+	// Defaults are computed by Normalize; ask only what the method needs.
+	probe := tc
+	if err := tunnel.Normalize(&probe, nil); err != nil && !strings.Contains(err.Error(), "already") {
+		Err(err.Error())
+		Pause()
+		return
+	}
+	switch {
+	case tc.Reverse && !m.NeedsPort:
+		tc.Port = askInt("Reverse carrier TCP port (Iran listens, Kharej dials)", probe.Port)
+	case m.NeedsPort:
+		tc.Port = askInt("Tunnel port", probe.Port)
+	case m.SupportsFOU:
+		tc.Port = askInt("Wrap in UDP/FOU port (0 = off, raw IP)", 0)
+	}
+	if m.Name == "eoip" {
+		tc.TunnelID = uint16(askInt("EoIP tunnel-id (must match MikroTik)", int(probe.TunnelID)))
+	}
+	if m.SupportsLanes {
+		tc.Lanes = askInt("Parallel lanes 1-8 (same count on both servers)", probe.Lanes)
+	}
+	if m.Family == catalog.FamilyUDPCrypt {
+		tc.Padding = askInt("Random padding bytes 1-64", probe.Padding)
+	}
+	if role == "iran" && !tunnel.IPv6Only(m.Name) {
+		Subtle("Ports users connect to on this server, sent to the kharej server.")
+		Subtle("Example: 443, 8080, 2053=8443 (listen=target)")
+		tc.Ports = tunnel.ParsePorts(Ask("Forward ports (blank = none)", ""))
+	}
+	probe.Port, probe.Padding = tc.Port, tc.Padding
+	tc.MTU = askInt("Tunnel MTU", tunnel.DefaultMTU(m, tc.Port, probe.Padding))
+	tc.RateMbps = askInt("Rate limit Mbit/s (0 = none)", 0)
+
+	if err := tunnel.Create(st, &tc); err != nil {
+		Err(err.Error())
+		Pause()
+		return
+	}
+	applyAndReport(tc)
+	showLink(tc)
+	Pause()
+}
+
+func setupKharej() {
+	Header()
+	Title("Setup Kharej")
+	raw := Ask("Paste the natix:// link (blank = configure by hand)", "")
+	if raw == "" {
+		setupWizard("kharej")
+		return
+	}
+	setupKharejLink(raw)
+}
+
+// setupKharejLink creates and starts the tunnel described by a natix:// link.
+func setupKharejLink(raw string) {
+	if raw == "" {
+		return
+	}
+	tc, err := catalog.DecodeSetupLink(raw)
+	if err != nil {
+		Err(err.Error())
+		Pause()
+		return
+	}
+	st, ok := loadStore()
+	if !ok {
+		return
+	}
+	KV("Method", tc.Method)
+	KV("Peer", tc.RemoteIP)
+	KV("This server", tc.LocalIP)
+	KV("Tunnel IPv4", tc.TunLocal4+" -> "+tc.TunRemote4)
+	if old, exists := st.Find(tc.Name); exists && old.RemoteIP != tc.RemoteIP {
+		tc.Name = Ask("Name "+tc.Name+" is taken here, new local name", "")
+	}
+	if !Confirm("Create and start this tunnel?", true) {
+		return
+	}
+	if err := tunnel.Import(st, &tc); err != nil {
+		Err(err.Error())
+		Pause()
+		return
+	}
+	applyAndReport(tc)
+	Pause()
+}
+
+func applyAndReport(tc catalog.TunnelConfig) {
+	if err := tunnel.Apply(tc); err != nil {
+		Err("Saved, but starting failed: " + err.Error())
+		Subtle("Details: journalctl -u " + tunnel.Unit(tc) + " -n 30")
+		return
+	}
+	Ok(fmt.Sprintf("Tunnel %s (%s) is running: %s -> %s", tc.Name, tc.Method, tc.TunLocal4, tc.TunRemote4))
+	for _, p := range tc.Ports {
+		src, dst, _ := strings.Cut(p, "=")
+		if dst == "" {
+			dst = src
+		}
+		Subtle(fmt.Sprintf("port %s on this server -> %s:%s on the kharej server", src, tc.TunRemote4, dst))
+	}
+}
+
+func showLink(tc catalog.TunnelConfig) {
+	link, _ := catalog.EncodeSetupLink(tc)
+	Title("Link For The Other Server")
+	Subtle("On the other server: natix -> Setup Kharej -> paste:")
+	fmt.Printf("\n   %s%s%s\n", Bold+White, link, Reset)
+	fmt.Printf("\n   Secret token: %s%s%s\n", Bold+White, tc.Token, Reset)
+	Subtle("A server without this token cannot join the tunnel.")
+	if mk := tunnel.MikroTik(tc); mk != "" {
+		Title("If The Other Side Is MikroTik (RouterOS 7)")
+		fmt.Printf("%s%s%s\n", Gray, mk, Reset)
+	}
+}
+
+// ─── Tunnels ─────────────────────────────────────────────────────────────────
+
+func humanBytes(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func stateLabel(s tunnel.Status) string {
+	switch {
+	case s.Up():
+		return "up"
+	case s.Service == "active":
+		return "no link"
+	default:
+		return s.Service
+	}
+}
+
+func printStatusTable(st *catalog.Store) {
+	fmt.Printf(" %s%-9s %-12s %-6s %-16s %-14s %-6s %-8s %s%s\n", Bold+White,
+		"NAME", "METHOD", "ROLE", "REMOTE", "TUNNEL IP", "PORT", "STATE", "RX / TX", Reset)
+	Rule()
+	for _, t := range st.Tunnels {
+		s := tunnel.GetStatus(t)
+		meth := methodLabel(t)
+		fmt.Printf(" %-9s %-12s %-6s %-16s %-14s %-6d %-8s %s / %s\n",
+			t.Name, meth, t.Role, t.RemoteIP, t.TunLocal4, t.Port, stateLabel(s),
+			humanBytes(s.RxBytes), humanBytes(s.TxBytes))
+	}
+}
+
+func methodLabel(t catalog.TunnelConfig) string {
+	if !t.Reverse {
+		return t.Method
+	}
+	if m, ok := catalog.LookupMethod(t.Method); ok && m.Family != catalog.FamilyUDPCrypt && m.Name != "wireguard" {
+		return "frp+" + t.Method
+	}
+	return "rev+" + t.Method
+}
+
+// ConnectionTestScreen finds out which methods pass between two servers and how fast.
+func ConnectionTestScreen() {
+	Header()
+	switch ChooseOpt("Connection Test", []MenuOpt{
+		{"Iran", "start, get a link"},
+		{"Kharej", "paste the link, run"},
+		{"Speed test", "to any IP"},
+	}) {
+	case 1:
+		connTestIran()
+	case 2:
+		connTestKharej(Ask("Link from iran", ""))
+	case 3:
+		speedTestScreen()
+	}
+}
+
+func connTestIran() {
+	Header()
+	Title("Connection Test — Iran")
+	host := Ask("This server's public IP", detectIP("udp4", "8.8.8.8:80"))
+	link := conntest.Link{Host: host, UDPPort: conntest.DefaultUDPPort, TCPPort: speedtest.DefaultSpeedPort, TokenHex: conntest.NewToken()}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	r, err := conntest.Serve(ctx, link.UDPPort, link.TokenHex)
+	if err != nil {
+		Err(err.Error())
+		Pause()
+		return
+	}
+	_, stop, err := speedtest.StartServer(fmt.Sprintf(":%d", link.TCPPort))
+	if err != nil {
+		Err(err.Error())
+		Pause()
+		return
+	}
+	defer stop()
+
+	Ok(fmt.Sprintf("Ready · UDP %d · TCP %d · IP %v", link.UDPPort, link.TCPPort, r.RawOpen))
+	Subtle("On kharej: natix → 0 → Kharej, and paste:")
+	fmt.Printf("\n   %s%s%s\n\n", Bold+White, conntest.EncodeLink(link), Reset)
+	Subtle("Live results show here. Enter = stop.")
+	attachResponderUI(r, host)
+	_, _ = reader.ReadString('\n')
+}
+
+func attachResponderUI(r *conntest.Responder, title string) {
+	board := conntest.NewBoard(os.Stdout, title)
+	r.SetCallbacks(
+		func(rows []conntest.Result) {
+			board.Update(rows)
+		},
+		func(rep conntest.Report) {
+			board.Clear()
+			peer := rep.Peer
+			if peer == "" {
+				peer = title
+			}
+			fmt.Print(conntest.Verdict(peer, rep.Rows))
+			fmt.Println()
+			fmt.Print(rep.Best.String())
+		},
+	)
+}
+
+// RunConnTest runs the kharej side and prints the live board, the verdict and the
+// best settings; shared by the menu and the CLI.
+func RunConnTest(raw string) error {
+	link, err := conntest.DecodeLink(raw)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	board := conntest.NewBoard(os.Stdout, link.Host)
+	rows, err := conntest.Run(ctx, link, board.Update)
+	if err != nil {
+		return err
+	}
+	board.Clear()
+	fmt.Print(conntest.Verdict(link.Host, rows))
+
+	best := conntest.BestSettings(rows, conntest.PathMTU(ctx, link))
+	conntest.SendReport(ctx, link, rows, best)
+	fmt.Println()
+	fmt.Print(best.String())
+	return nil
+}
+
+func connTestKharej(raw string) {
+	if raw == "" {
+		return
+	}
+	Header()
+	if err := RunConnTest(raw); err != nil {
+		Err(err.Error())
+	}
+	Pause()
+}
+
+func speedTestScreen() {
+	Header()
+	switch ChooseOpt("Speed Test", []MenuOpt{
+		{"Run test", "to a server that runs the responder"},
+		{"Start responder", "let the other server test against this one"},
+	}) {
+	case 1:
+		host := Ask("Target IP (a public IP, or a tunnel IP like 10.77.1.2)", "")
+		if host == "" {
+			return
+		}
+		port := askInt("Responder port", speedtest.DefaultSpeedPort)
+		Info("Testing (about 10 seconds)...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		r := speedtest.Run(ctx, net.JoinHostPort(host, strconv.Itoa(port)), 20)
+		Title("Results")
+		fmt.Print(speedtest.Format(r))
+		Pause()
+	case 2:
+		port := askInt("Listen port (TCP, open it in the firewall)", speedtest.DefaultSpeedPort)
+		addr, stop, err := speedtest.StartServer(fmt.Sprintf(":%d", port))
+		if err != nil {
+			Err(err.Error())
+			Pause()
+			return
+		}
+		defer stop()
+		Ok("Responder listening on " + addr + ". Run the test from the other server now.")
+		Info("Press Enter to stop.")
+		_, _ = reader.ReadString('\n')
+	}
+}
+
+func systemctlRun(args ...string) error {
+	out, err := tunnel.Run("systemctl", args...)
+	if err != nil {
+		return fmt.Errorf("systemctl %s: %s", strings.Join(args, " "), out)
+	}
+	return nil
+}
+
+func reportErr(errs ...error) {
+	for _, err := range errs {
+		if err != nil {
+			Err(err.Error())
+			Pause()
+			return
+		}
+	}
+	Ok("Done.")
+	time.Sleep(600 * time.Millisecond)
+}
+
+// ─── Optimize, backup, update, uninstall ────────────────────────────────────
+
+func optimizeScreen() {
+	Header()
+	Title("Optimize")
+	Subtle("Writes /etc/sysctl.d/99-natix.conf: BBR + fq, 64 MB socket buffers,")
+	Subtle("IPv4/IPv6 forwarding, ECMP hashing, loose rp_filter, larger conntrack.")
+	fmt.Println()
+	if Confirm("Apply now?", true) {
+		if err := tunnel.Optimize(); err != nil {
+			Err(err.Error())
+		} else {
+			Ok("Applied.")
+		}
+	}
+	Pause()
+}
+
+const backupFile = "/root/natix-backup.json"
+
+func backupRestoreMenu() {
+	Header()
+	switch ChooseOpt("Backup & Restore", []MenuOpt{
+		{"Create backup", backupFile},
+		{"Restore backup", "re-creates and starts every tunnel in the file"},
+	}) {
+	case 1:
+		st, ok := loadStore()
+		if !ok {
+			return
+		}
+		b, _ := json.MarshalIndent(st, "", "  ")
+		if err := os.WriteFile(backupFile, b, 0o600); err != nil {
+			Err(err.Error())
+		} else {
+			Ok(fmt.Sprintf("Saved %d tunnels to %s", len(st.Tunnels), backupFile))
+		}
+	case 2:
+		path := Ask("Backup file", backupFile)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			Err(err.Error())
+			break
+		}
+		var saved catalog.Store
+		if err := json.Unmarshal(b, &saved); err != nil {
+			Err("Not a Natix backup: " + err.Error())
+			break
+		}
+		st, ok := loadStore()
+		if !ok {
+			return
+		}
+		if saved.GitHubRepo != "" {
+			st.GitHubRepo = saved.GitHubRepo
+		}
+		for _, name := range tunnelNames(st) {
+			_ = tunnel.Remove(st, name)
+		}
+		for _, tc := range saved.Tunnels {
+			if err := tunnel.Save(st, &tc); err != nil {
+				Err(tc.Name + ": " + err.Error())
+				continue
+			}
+			applyAndReport(tc)
+		}
+	default:
+		return
+	}
+	Pause()
+}
+
+func tunnelNames(st *catalog.Store) []string {
+	var names []string
+	for _, t := range st.Tunnels {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
+func updateMenu() {
+	st, ok := loadStore()
+	if !ok {
+		return
+	}
+	repo := strings.TrimRight(st.GitHubRepo, "/")
+	Header()
+	Title("Update")
+	KV("Installed", version.Version)
+	KV("Repository", repo)
+	if v := latestVersion(repo); v != "" {
+		KV("Latest on GitHub", v)
+	}
+	switch ChooseOpt("Update", []MenuOpt{
+		{"Update now", "install the latest GitHub release"},
+		{"Change repository", "use another GitHub repository"},
+	}) {
+	case 1:
+		slug := strings.TrimPrefix(repo, "https://github.com/")
+		installer := "https://raw.githubusercontent.com/" + slug + "/main/install.sh"
+		Info("Installing the latest release (every file is SHA-256 checked)")
+		script := fmt.Sprintf(`set -e; f=$(mktemp); curl -fsSL --connect-timeout 15 %q -o "$f"; NATIX_REPO=%q bash "$f"; rm -f "$f"`, installer, slug)
+		cmd := exec.Command("bash", "-c", script)
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			Err("Update failed; the installed version is unchanged: " + err.Error())
+		} else {
+			Ok("Updated. Launching the new version...")
+			re := exec.Command("/usr/local/bin/natix")
+			re.Stdin, re.Stdout, re.Stderr = os.Stdin, os.Stdout, os.Stderr
+			_ = re.Run()
+			os.Exit(0)
+		}
+	case 2:
+		if r := strings.TrimRight(Ask("GitHub repository URL", repo), "/"); strings.HasPrefix(r, "https://github.com/") {
+			st.GitHubRepo = r
+			reportErr(st.Save())
+			return
+		}
+		Err("Must start with https://github.com/")
+	default:
+		return
+	}
+	Pause()
+}
+
+func latestVersion(repo string) string {
+	api := "https://api.github.com/repos/" + strings.TrimPrefix(repo, "https://github.com/") + "/releases/latest"
+	client := &http.Client{Timeout: 6 * time.Second}
+	resp, err := client.Get(api)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var rel struct {
+		TagName string `json:"tag_name"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&rel) != nil {
+		return ""
+	}
+	return rel.TagName
+}
+
+func uninstallScreen() {
+	Header()
+	Title("Uninstall")
+	Warn("Stops and deletes every tunnel and all Natix files.")
+	if !Confirm("Uninstall Natix?", false) {
+		return
+	}
+	if st, err := catalog.LoadStore(StoreDir); err == nil {
+		for _, name := range tunnelNames(st) {
+			_ = tunnel.Remove(st, name)
+		}
+	}
+	localproxy.Remove()
+	_ = schedule.SetAutoRefresh(0)
+	for _, p := range []string{
+		StoreDir, "/etc/sysctl.d/99-natix.conf", "/usr/local/lib/natix",
+		"/etc/systemd/system/natix@.service", "/etc/systemd/system/natix-engine@.service",
+		"/usr/local/bin/natix-engine", "/usr/local/bin/natix",
+	} {
+		_ = os.RemoveAll(p)
+	}
+	_ = systemctlRun("daemon-reload")
+	Ok("Natix removed.")
+	os.Exit(0)
+}
+
+func detectIP(network, probe string) string {
+	conn, err := net.DialTimeout(network, probe, 800*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if a, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return a.IP.String()
+	}
+	return ""
+}
+
+// StatusTable prints the tunnel table for `natix status`.
+func StatusTable() {
+	st, err := catalog.LoadStore(StoreDir)
+	if err != nil {
+		Err(err.Error())
+		return
+	}
+	if len(st.Tunnels) == 0 {
+		Info("No tunnels configured.")
+		return
+	}
+	printStatusTable(st)
+}
+
+// ConnTestServer runs the iran side of the connection test until interrupted.
+func ConnTestServer(host string) {
+	if host == "" {
+		host = detectIP("udp4", "8.8.8.8:80")
+	}
+	link := conntest.Link{Host: host, UDPPort: conntest.DefaultUDPPort, TCPPort: speedtest.DefaultSpeedPort, TokenHex: conntest.NewToken()}
+	r, err := conntest.Serve(context.Background(), link.UDPPort, link.TokenHex)
+	if err != nil {
+		Err(err.Error())
+		os.Exit(1)
+	}
+	if _, _, err := speedtest.StartServer(fmt.Sprintf(":%d", link.TCPPort)); err != nil {
+		Err(err.Error())
+		os.Exit(1)
+	}
+	fmt.Printf("responder ready: UDP %d, TCP %d, IP protocols %v\n", link.UDPPort, link.TCPPort, r.RawOpen)
+	fmt.Printf("on the kharej server run:\n  sudo natix conntest '%s'\n\n", conntest.EncodeLink(link))
+	attachResponderUI(r, host)
+	select {}
+}
