@@ -1,0 +1,237 @@
+package tunnel
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"natix/internal/catalog"
+)
+
+const KernelHelper = "/usr/local/lib/natix/natix-kernel"
+
+var Run = func(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+func Unit(tc catalog.TunnelConfig) string {
+	if m, ok := catalog.LookupMethod(tc.Method); ok && (m.Userspace || (tc.Reverse && m.Name != "wireguard")) {
+		return "natix-engine@" + tc.Name + ".service"
+	}
+	return "natix@" + tc.Name + ".service"
+}
+
+func otherUnit(tc catalog.TunnelConfig) string {
+	if strings.HasPrefix(Unit(tc), "natix-engine@") {
+		return "natix@" + tc.Name + ".service"
+	}
+	return "natix-engine@" + tc.Name + ".service"
+}
+
+func systemctl(args ...string) error {
+	out, err := Run("systemctl", args...)
+	if err != nil {
+		if out == "" {
+			out = err.Error()
+		}
+		return fmt.Errorf("systemctl %s: %s", strings.Join(args, " "), out)
+	}
+	return nil
+}
+
+func Save(st *catalog.Store, tc *catalog.TunnelConfig) error {
+	name := SanitizeName(tc.Name)
+	var others []catalog.TunnelConfig
+	for _, t := range st.Tunnels {
+		if t.Name != name {
+			others = append(others, t)
+		}
+	}
+	if err := Normalize(tc, others); err != nil {
+		return err
+	}
+	if old, exists := st.Find(tc.Name); exists {
+		if err := Stop(old); err != nil {
+			return fmt.Errorf("stop existing tunnel: %w", err)
+		}
+		if err := kernelDown(old.Name); err != nil {
+			return err
+		}
+	}
+	if err := WriteEnv(st.Dir, *tc); err != nil {
+		return err
+	}
+	return st.Upsert(*tc)
+}
+
+func Create(st *catalog.Store, tc *catalog.TunnelConfig) error {
+	tc.Name = SanitizeName(tc.Name)
+	if _, exists := st.Find(tc.Name); exists && tc.Name != "" {
+		return fmt.Errorf("a tunnel named %q already exists", tc.Name)
+	}
+	return Save(st, tc)
+}
+
+func Import(st *catalog.Store, tc *catalog.TunnelConfig) error {
+	tc.Name = SanitizeName(MirrorName(tc.Name, tc.Role))
+	if strings.TrimSpace(tc.LocalIP) == "" || tc.LocalIP == "0.0.0.0" || tc.LocalIP == "::" {
+		if ip := detectLocalIP(tc.Method); ip != "" {
+			tc.LocalIP = ip
+		}
+	}
+	if old, exists := st.Find(tc.Name); exists && old.RemoteIP != tc.RemoteIP {
+		return fmt.Errorf("a tunnel named %q to %s already exists; import it under another name", tc.Name, old.RemoteIP)
+	}
+	return Save(st, tc)
+}
+
+func detectLocalIP(method string) string {
+	netw, target := "udp4", "8.8.8.8:80"
+	if m, ok := catalog.LookupMethod(method); ok && m.IPv6Underlay {
+		netw, target = "udp6", "[2001:4860:4860::8888]:80"
+	}
+	c, err := net.DialTimeout(netw, target, 600*time.Millisecond)
+	if err != nil {
+		return ""
+	}
+	defer c.Close()
+	if a, ok := c.LocalAddr().(*net.UDPAddr); ok {
+		return a.IP.String()
+	}
+	return ""
+}
+
+func Apply(tc catalog.TunnelConfig) error {
+	other := otherUnit(tc)
+	if err := systemctl("disable", "--now", other); err != nil && unitActive(other) {
+		return fmt.Errorf("cannot stop old unit %s: %w", other, err)
+	}
+	if err := systemctl("enable", Unit(tc)); err != nil {
+		return err
+	}
+	return systemctl("restart", Unit(tc))
+}
+
+func unitActive(unit string) bool {
+	_, err := Run("systemctl", "is-active", "--quiet", unit)
+	return err == nil
+}
+
+func Stop(tc catalog.TunnelConfig) error {
+	_ = systemctl("disable", "--now", otherUnit(tc))
+	_ = systemctl("disable", "--now", Unit(tc))
+	if unitActive(Unit(tc)) || unitActive(otherUnit(tc)) {
+		return errors.New("tunnel service is still active")
+	}
+	return nil
+}
+
+func Logs(tc catalog.TunnelConfig, n int) string {
+	out, _ := Run("journalctl", "-u", Unit(tc), "-n", fmt.Sprint(n), "--no-pager", "-o", "short-iso")
+	return out
+}
+
+func Since(tc catalog.TunnelConfig) string {
+	out, _ := Run("systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", Unit(tc))
+	return strings.TrimSpace(out)
+}
+
+func Remove(st *catalog.Store, name string) error {
+	tc, ok := st.Find(name)
+	if !ok {
+		return fmt.Errorf("tunnel %q not found", name)
+	}
+	if err := Stop(tc); err != nil {
+		return fmt.Errorf("stop %s: %w", name, err)
+	}
+	if err := kernelDown(name); err != nil {
+		return err
+	}
+	if err := st.Delete(name); err != nil {
+		return err
+	}
+	_ = os.Remove(EnvPath(st.Dir, name))
+	forgetTraffic(name)
+	return nil
+}
+
+func kernelDown(name string) error {
+	if _, err := os.Stat(KernelHelper); err != nil {
+		if _, ifErr := net.InterfaceByName(Dev(name)); ifErr == nil {
+			return fmt.Errorf("kernel helper is missing; cannot tear down %s", Dev(name))
+		}
+		return nil
+	}
+	out, err := Run(KernelHelper, "down", name)
+	if err == nil {
+		return nil
+	}
+	if out == "" {
+		out = err.Error()
+	}
+	return fmt.Errorf("tear down %s: %s", name, out)
+}
+
+type Status struct {
+	Service string `json:"service"` // systemd ActiveState: active, failed, inactive...
+	LinkUp  bool   `json:"link_up"`
+	RxBytes uint64 `json:"rx_bytes"` // since the tunnel was created, across restarts and reboots
+	TxBytes uint64 `json:"tx_bytes"`
+}
+
+func (s Status) Up() bool { return s.Service == "active" && s.LinkUp }
+
+func GetStatuses(tcs []catalog.TunnelConfig) []Status {
+	out := make([]Status, len(tcs))
+	if len(tcs) == 0 {
+		return out
+	}
+	args := []string{"is-active"}
+	for _, tc := range tcs {
+		args = append(args, Unit(tc))
+	}
+	text, _ := Run("systemctl", args...)
+	lines := strings.Fields(text)
+	for i, tc := range tcs {
+		if len(lines) != len(tcs) {
+			out[i] = GetStatus(tc)
+			continue
+		}
+		out[i] = statusFor(tc, lines[i])
+	}
+	return out
+}
+
+func GetStatus(tc catalog.TunnelConfig) Status {
+	state, _ := Run("systemctl", "is-active", Unit(tc))
+	return statusFor(tc, state)
+}
+
+func statusFor(tc catalog.TunnelConfig, state string) Status {
+	var s Status
+	s.Service = state
+	if s.Service = strings.TrimSpace(s.Service); s.Service == "" || len(s.Service) > 16 || strings.ContainsAny(s.Service, " \n") {
+		s.Service = "unknown"
+	}
+	if ifc, err := net.InterfaceByName(Dev(tc.Name)); err == nil {
+		s.LinkUp = ifc.Flags&net.FlagUp != 0
+	}
+	s.RxBytes, s.TxBytes = TrafficTotal(tc.Name)
+	return s
+}
+
+func Optimize() error {
+	if _, err := os.Stat(KernelHelper); err != nil {
+		return errors.New("kernel helper not installed; run install.sh")
+	}
+	out, err := Run(KernelHelper, "optimize")
+	if err != nil {
+		return fmt.Errorf("optimize: %s", out)
+	}
+	return nil
+}
