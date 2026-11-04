@@ -2,7 +2,6 @@
 
 High-performance kernel L3/L2 tunnels, reverse TCP carrier, and encrypted UDP transports between servers with a lightweight Ubuntu CLI and connection quality tester.
 
----
 ## Features
 
 - **28 Tunnel Methods**: Kernel L3 (`gre`, `6to4`, `ipip`, `sit`, `wireguard`, `xfrm-ipsec`, `fou-gre`, `gue-ipip`, `ecmp-lanes`, ...) and L2 (`eoip`, `gretap`, `vxlan`, `geneve`, `l2tpv3`, `etherip`) plus 8 AES-256-GCM UDP-Crypt transports (`dtls-1.3`, `quic-v1`, `srtp-direct`, `wg-stealth`, `rudp-fec`, `dnscrypt-udp`, `ntp-direct`, `openvpn-dco`).
@@ -12,13 +11,12 @@ High-performance kernel L3/L2 tunnels, reverse TCP carrier, and encrypted UDP tr
 - **Port Forwarding & Built-in Proxy**: Per-tunnel iptables DNAT/SNAT port forwarding and optional built-in SOCKS5/HTTP loopback proxy.
 - **Pure CLI**: Lightweight, zero web-panel overhead, managed via `natix` interactive menu or subcommands on Ubuntu/Debian.
 
----
 ## Installation
 
 ### From GitHub Release (Both Servers)
 
 ```bash
-sudo bash -c "$(curl -sL https://raw.githubusercontent.com/amirmbn/Natix/main/install.sh)"
+bash -c "$(curl -sL https://raw.githubusercontent.com/amirmbn/Natix/main/install.sh)"
 ```
 
 ### From Local Source Checkout (Ubuntu)
@@ -26,16 +24,15 @@ sudo bash -c "$(curl -sL https://raw.githubusercontent.com/amirmbn/Natix/main/in
 ```bash
 git clone https://github.com/amirmbn/Natix.git
 cd Natix
-sudo NATIX_LOCAL=1 bash install.sh
+NATIX_LOCAL=1 bash install.sh
 ```
 
----
 ## CLI Usage
 
 Run interactive menu:
 
 ```bash
-sudo natix
+natix
 ```
 
 Direct commands:
@@ -59,7 +56,6 @@ Usage: natix [command]
   version                      show version
 ```
 
----
 ## Service & Configuration Paths
 
 - `/usr/local/bin/natix` — Management CLI
