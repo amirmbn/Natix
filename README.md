@@ -2,10 +2,7 @@
 
 High-performance kernel L3/L2 tunnels, reverse TCP carrier, and encrypted UDP transports between servers with a lightweight Ubuntu CLI and connection quality tester.
 
-Repository: [https://github.com/amirmbn/Natix](https://github.com/amirmbn/Natix)
-
 ---
-
 ## Features
 
 - **28 Tunnel Methods**: Kernel L3 (`gre`, `6to4`, `ipip`, `sit`, `wireguard`, `xfrm-ipsec`, `fou-gre`, `gue-ipip`, `ecmp-lanes`, ...) and L2 (`eoip`, `gretap`, `vxlan`, `geneve`, `l2tpv3`, `etherip`) plus 8 AES-256-GCM UDP-Crypt transports (`dtls-1.3`, `quic-v1`, `srtp-direct`, `wg-stealth`, `rudp-fec`, `dnscrypt-udp`, `ntp-direct`, `openvpn-dco`).
@@ -16,7 +13,6 @@ Repository: [https://github.com/amirmbn/Natix](https://github.com/amirmbn/Natix)
 - **Pure CLI**: Lightweight, zero web-panel overhead, managed via `natix` interactive menu or subcommands on Ubuntu/Debian.
 
 ---
-
 ## Installation
 
 ### From GitHub Release (Both Servers)
@@ -34,7 +30,6 @@ sudo NATIX_LOCAL=1 bash install.sh
 ```
 
 ---
-
 ## CLI Usage
 
 Run interactive menu:
@@ -65,7 +60,6 @@ Usage: natix [command]
 ```
 
 ---
-
 ## Service & Configuration Paths
 
 - `/usr/local/bin/natix` — Management CLI
