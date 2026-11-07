@@ -1,4 +1,4 @@
-# Natix
+# Natix ![GitHub Downloads](https://img.shields.io/github/downloads/amirmbn/Natix/total)
 
 High-performance kernel L3/L2 tunnels, reverse TCP carrier, and encrypted UDP transports between servers with a lightweight Ubuntu CLI and connection quality tester.
 
